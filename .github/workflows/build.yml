@@ -17,9 +17,7 @@ jobs:
           python-version: "3.12"
 
       - name: Install deps
-        run: |
-          pip install -r requirements.txt
-          python -m playwright install chromium
+        run: pip install playwright
 
       - name: Build EXE
         run: |
@@ -35,8 +33,8 @@ jobs:
         if: github.ref == 'refs/heads/main'
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v1.0.0
-          name: XDROP HAR Capture v1.0
+          tag_name: v2.0.0
+          name: XDROP HAR Capture v2.0
           files: dist/XDROP_HAR_Capture.exe
           draft: false
           prerelease: false
