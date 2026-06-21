@@ -1,0 +1,226 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>⚡ XDROP HAR Capture</title>
+<style>
+* { margin:0; padding:0; box-sizing:border-box; }
+body { background:#0d1117; color:#c9d1d9; font-family:Consolas,monospace; padding:20px; }
+h1 { color:#3fb950; font-size:24px; margin-bottom:6px; }
+.sub { color:#8b949e; font-size:12px; margin-bottom:20px; }
+.bar { display:flex; gap:12px; align-items:center; margin-bottom:20px; }
+.btn { padding:12px 28px; font-size:16px; font-weight:bold; border:none; border-radius:6px; cursor:pointer; font-family:Consolas,monospace; }
+.start { background:#238636; color:white; }
+.start:hover { background:#2ea043; }
+.stop { background:#da3633; color:white; }
+.stop:hover { background:#f85149; }
+.stop:disabled { background:#3d0000; color:#666; cursor:default; }
+.export { background:#1f6feb; color:white; }
+.export:hover { background:#388bfd; }
+.export:disabled { background:#0d1117; color:#484f58; cursor:default; }
+.status { font-size:14px; color:#8b949e; margin-bottom:6px; }
+.counter { font-size:13px; color:#484f58; margin-bottom:16px; }
+.log { background:#161b22; border-radius:6px; padding:12px; height:400px; overflow-y:auto; font-size:11px; line-height:1.6; }
+.log .req { color:#58a6ff; }
+.log .res { color:#3fb950; }
+.log .err { color:#f85149; }
+.info { background:#161b22; border-radius:6px; padding:12px; margin-bottom:16px; font-size:11px; color:#8b949e; }
+</style>
+</head>
+<body>
+<h1>⚡ XDROP HAR Capture</h1>
+<p class="sub">Klik Start → buka tab baru → registrasi & payment → balik sini → klik Stop → Export HAR</p>
+
+<div class="info">
+<strong>Cara pakai:</strong><br>
+1. Klik <strong>START CAPTURE</strong><br>
+2. Buka tab baru (Ctrl+T), navigasi ke target URL<br>
+3. Lakukan registrasi + payment di tab baru<br>
+4. Balik ke tab ini, klik <strong>STOP</strong><br>
+5. Klik <strong>EXPORT HAR</strong> → file auto-download
+</div>
+
+<div class="bar">
+  <button class="btn start" id="startBtn" onclick="startCapture()">▶ START CAPTURE</button>
+  <button class="btn stop" id="stopBtn" onclick="stopCapture()" disabled>⏹ STOP</button>
+  <button class="btn export" id="exportBtn" onclick="exportHAR()" disabled>💾 EXPORT HAR</button>
+</div>
+
+<div class="status" id="status">Ready.</div>
+<div class="counter" id="counter">Requests: 0</div>
+<div class="log" id="log"></div>
+
+<script>
+let capturing = false;
+let entries = [];
+let reqMap = {};
+
+// Override fetch
+const origFetch = window.fetch;
+window.fetch = async function(...args) {
+  const [input, init] = args;
+  const url = typeof input === 'string' ? input : input.url;
+  const method = (init?.method || (input?.method) || 'GET').toUpperCase();
+  const headers = {};
+  if (init?.headers) {
+    if (init.headers instanceof Headers) {
+      init.headers.forEach((v, k) => headers[k] = v);
+    } else if (typeof init.headers === 'object') {
+      Object.assign(headers, init.headers);
+    }
+  }
+  const postData = init?.body || '';
+  const rid = 'f_' + Math.random().toString(36).slice(2);
+
+  if (capturing) {
+    logReq(method, url);
+    reqMap[rid] = { method, url, headers, postData: typeof postData === 'string' ? postData : '[binary]', ts: Date.now() };
+  }
+
+  try {
+    const resp = await origFetch.apply(this, args);
+    if (capturing && reqMap[rid]) {
+      const cloned = resp.clone();
+      let body = '';
+      try { body = await cloned.text(); } catch(e) {}
+      const respHeaders = {};
+      cloned.headers.forEach((v, k) => respHeaders[k] = v);
+      entries.push(buildEntry(reqMap[rid], resp.status, respHeaders, cloned.headers.get('content-type') || '', body));
+      logResp(resp.status, url);
+    }
+    return resp;
+  } catch(e) {
+    if (capturing && reqMap[rid]) {
+      entries.push(buildEntry(reqMap[rid], 0, {}, '', 'ERROR: ' + e.message));
+      logErr(url, e.message);
+    }
+    throw e;
+  }
+};
+
+// Override XMLHttpRequest
+const origXHR = XMLHttpRequest.prototype.open;
+const origSend = XMLHttpRequest.prototype.send;
+XMLHttpRequest.prototype.open = function(method, url) {
+  this._harMethod = method;
+  this._harUrl = url;
+  this._harHeaders = {};
+  return origXHR.apply(this, arguments);
+};
+XMLHttpRequest.prototype.setRequestHeader = function(name, value) {
+  this._harHeaders[name] = value;
+  return XMLHttpRequest.prototype.setRequestHeader ? XMLHttpRequest.prototype.setRequestHeader.apply(this, arguments) : null;
+};
+XMLHttpRequest.prototype.send = function(body) {
+  const rid = 'x_' + Math.random().toString(36).slice(2);
+  if (capturing) {
+    logReq(this._harMethod || 'GET', this._harUrl);
+    reqMap[rid] = {
+      method: this._harMethod || 'GET',
+      url: this._harUrl,
+      headers: this._harHeaders || {},
+      postData: typeof body === 'string' ? body : '[binary]',
+      ts: Date.now()
+    };
+  }
+  this.addEventListener('load', function() {
+    if (capturing && reqMap[rid]) {
+      entries.push(buildEntry(reqMap[rid], this.status, {}, '', this.responseText || ''));
+      logResp(this.status, reqMap[rid].url);
+    }
+  });
+  this.addEventListener('error', function() {
+    if (capturing && reqMap[rid]) {
+      entries.push(buildEntry(reqMap[rid], 0, {}, '', 'ERROR'));
+      logErr(reqMap[rid].url, 'network error');
+    }
+  });
+  return origSend.apply(this, arguments);
+};
+
+function buildEntry(req, status, respHeaders, mime, body) {
+  return {
+    startedDateTime: new Date(req.ts).toISOString(),
+    time: 0,
+    request: {
+      method: req.method, url: req.url, httpVersion: 'HTTP/1.1',
+      headers: Object.entries(req.headers).map(([k,v]) => ({name:k,value:v})),
+      queryString: [], headersSize: -1, bodySize: (req.postData||'').length,
+      postData: req.postData ? {text: req.postData} : null, cookies: []
+    },
+    response: {
+      status, statusText: '', httpVersion: 'HTTP/1.1',
+      headers: Object.entries(respHeaders).map(([k,v]) => ({name:k,value:v})),
+      content: { size: (body||'').length, mimeType: mime, text: body || '' },
+      cookies: [], redirectURL: '', headersSize: -1, bodySize: (body||'').length
+    },
+    cache: {}, timings: { send: 0, wait: 0, receive: 0 }
+  };
+}
+
+function startCapture() {
+  capturing = true;
+  entries = [];
+  reqMap = {};
+  document.getElementById('startBtn').disabled = true;
+  document.getElementById('stopBtn').disabled = false;
+  document.getElementById('exportBtn').disabled = true;
+  document.getElementById('status').textContent = '🟢 Recording... Buka tab baru untuk checkout';
+  document.getElementById('counter').textContent = 'Requests: 0';
+  document.getElementById('log').innerHTML = '';
+  logMsg('Capture started. Buka tab baru (Ctrl+T) dan navigasi ke target URL.', 'req');
+}
+
+function stopCapture() {
+  capturing = false;
+  document.getElementById('startBtn').disabled = false;
+  document.getElementById('stopBtn').disabled = true;
+  document.getElementById('exportBtn').disabled = false;
+  document.getElementById('status').textContent = `✅ Stopped. ${entries.length} requests captured. Klik EXPORT HAR.`;
+}
+
+function exportHAR() {
+  const har = {
+    log: {
+      version: '1.2',
+      creator: { name: 'XDROP HAR Capture', version: '2.0' },
+      entries: entries
+    }
+  };
+  const blob = new Blob([JSON.stringify(har, null, 2)], { type: 'application/json' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = 'merlin_' + new Date().toISOString().replace(/[:.]/g, '-').slice(0,19) + '.har';
+  a.click();
+  document.getElementById('status').textContent = `✅ Downloaded ${entries.length} requests as HAR`;
+}
+
+function logReq(method, url) {
+  const el = document.getElementById('log');
+  const short = url.length > 80 ? url.slice(0, 80) + '...' : url;
+  el.innerHTML += `<div class="req">→ ${method} ${short}</div>`;
+  el.scrollTop = el.scrollHeight;
+  document.getElementById('counter').textContent = `Requests: ${entries.length}`;
+}
+
+function logResp(status, url) {
+  const el = document.getElementById('log');
+  const color = status >= 200 && status < 400 ? 'res' : 'err';
+  el.innerHTML += `<div class="${color}">← ${status}</div>`;
+  el.scrollTop = el.scrollHeight;
+  document.getElementById('counter').textContent = `Requests: ${entries.length}`;
+}
+
+function logErr(url, msg) {
+  const el = document.getElementById('log');
+  el.innerHTML += `<div class="err">✗ ${msg}</div>`;
+  el.scrollTop = el.scrollHeight;
+}
+
+function logMsg(msg, cls) {
+  const el = document.getElementById('log');
+  el.innerHTML += `<div class="${cls}">${msg}</div>`;
+}
+</script>
+</body>
+</html>
